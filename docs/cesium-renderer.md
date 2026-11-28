@@ -26,7 +26,12 @@ can alternatively set `CESIUM_TOKEN` or `VITE_CESIUM_TOKEN` at build time. See
   rendering. Labels follow their anchor, offset, maximum width, and
   data-defined size, colour, opacity, and visibility; they are not rotated,
   not drawn along a line's path, and not thinned by collision. Points and
-  labels on the far side of the Earth are hidden.
+  labels on the far side of the Earth are hidden. Extrusion height, base
+  and colour expressions that read `["zoom"]` are evaluated at the camera's
+  fractional zoom and refresh when the camera stops moving, not on every
+  frame. A polygon whose coordinates carry Z keeps its vertex heights as the
+  floor, raised by the extrusion base, so stacked floors with Z values no
+  longer all start at their vertex heights.
 - XYZ, WMS, WMTS, COG, raster PMTiles, local MBTiles, image overlays, and other
   tile sources connected through GeoLibre's protocol bridge. COGs whose JPEG
   tiles omit their own tables (Maxar/Vantor open data) decode through

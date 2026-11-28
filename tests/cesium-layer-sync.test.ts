@@ -33,6 +33,8 @@ function makeFakes() {
     geojsonLoads: [] as { data: unknown; options: Record<string, unknown> }[],
     tilesetUrls: [] as unknown[],
     cameraListeners: [] as (() => void)[],
+    moveEndListeners: [] as (() => void)[],
+    changedListeners: [] as (() => void)[],
     suspendEventsCount: 0,
     resumeEventsCount: 0,
   };
@@ -42,8 +44,8 @@ function makeFakes() {
       currentTime: { dayNumber: 0, secondsOfDay: 0 },
     },
     camera: {
-      moveEnd: mkEvent(calls.cameraListeners),
-      changed: mkEvent(calls.cameraListeners),
+      moveEnd: mkEvent(calls.cameraListeners, calls.moveEndListeners),
+      changed: mkEvent(calls.cameraListeners, calls.changedListeners),
     },
     scene: {
       canvas: { clientWidth: 800, clientHeight: 600, width: 800, height: 600 },
@@ -366,15 +368,17 @@ function mkPolygonLayer(id: string, name: string): GeoLibreLayer {
   });
 }
 
-/** A minimal Cesium `Event` stand-in that records its listeners in `bag`. */
-function mkEvent(bag: (() => void)[]) {
+/** A minimal Cesium `Event` stand-in that records its listeners in each of `bags`. */
+function mkEvent(...bags: (() => void)[][]) {
   return {
     addEventListener: (fn: () => void) => {
-      bag.push(fn);
+      for (const bag of bags) bag.push(fn);
     },
     removeEventListener: (fn: () => void) => {
-      const i = bag.indexOf(fn);
-      if (i >= 0) bag.splice(i, 1);
+      for (const bag of bags) {
+        const i = bag.indexOf(fn);
+        if (i >= 0) bag.splice(i, 1);
+      }
     },
   };
 }
@@ -2316,6 +2320,476 @@ describe("CesiumLayerSync", () => {
     assert.equal(ext.height, undefined);
     assert.equal(ext.heightReference, undefined);
     assert.equal(ext.extrudedHeightReference, undefined);
+  });
+
+  it("lifts the vertices of a Z polygon by the extrusion base (#3346)", async () => {
+    // A "cartesian" here is the (lon, lat, height) it came from, and the fake
+    // GeoJsonDataSource gives the polygon its ring as that hierarchy.
+    const cesium = f.Cesium as unknown as Record<string, unknown>;
+    cesium.Cartographic = {
+      fromCartesian: (p: { x: number; y: number; z: number }) => ({
+        longitude: p.x,
+        latitude: p.y,
+        height: p.z,
+      }),
+    };
+    cesium.PolygonHierarchy = class {
+      constructor(
+        public positions: unknown[],
+        public holes: unknown[] = [],
+      ) {}
+    };
+    const load = f.Cesium.GeoJsonDataSource.load;
+    f.Cesium.GeoJsonDataSource.load = async (data, options) => {
+      const ds = await load(data, options);
+      for (const entity of ds.entities.values as Array<{ polygon?: Record<string, unknown> }>) {
+        if (entity.polygon?.perPositionHeight) {
+          entity.polygon.hierarchy = {
+            getValue: () => ({
+              positions: [
+                { x: 0, y: 0, z: 100 },
+                { x: 1, y: 0, z: 100 },
+                { x: 1, y: 1, z: 100 },
+              ],
+              holes: [{ positions: [{ x: 0.5, y: 0.2, z: 100 }], holes: [] }],
+            }),
+          };
+        }
+      }
+      return ds;
+    };
+    const sync = newSync(f);
+    const zRing = [
+      [0, 0, 100],
+      [1, 0, 100],
+      [1, 1, 100],
+      [0, 0, 100],
+    ];
+    sync.sync([
+      mkLayer({
+        id: "floor-z",
+        type: "geojson",
+        geojson: {
+          type: "FeatureCollection",
+          features: [
+            {
+              type: "Feature",
+              properties: { level: 2, top: 10 },
+              geometry: { type: "Polygon", coordinates: [zRing] },
+            },
+          ],
+        },
+        style: {
+          extrusionEnabled: true,
+          extrusionHeightProperty: "top",
+          extrusionBaseProperty: "level",
+          extrusionBaseScale: 3,
+        },
+      }),
+    ]);
+    await f.flush();
+    const ds = f.calls.dataSourcesAdded[0] as {
+      entities: {
+        values: Array<{
+          polygon?: {
+            hierarchy?: { value: { positions: Array<{ z: number }> } };
+            extrudedHeight?: { value: number };
+          };
+        }>;
+      };
+    };
+    const polygon = ds.entities.values.find((e) => e.polygon)?.polygon;
+    assert.ok(polygon);
+    // The floor moves from the vertices' 100 m up by the 6 m base, as the 2D
+    // map starts the floor at its base; the roof stays at ring top + 10 m.
+    assert.deepEqual(
+      polygon.hierarchy?.value.positions.map((p) => p.z),
+      [106, 106, 106],
+    );
+    assert.equal(polygon.extrudedHeight?.value, 110);
+  });
+
+  it("re-offsets a Z polygon from its loaded vertices when a zoom base changes (#3346)", async () => {
+    const cesium = f.Cesium as unknown as Record<string, unknown>;
+    cesium.Cartographic = {
+      fromCartesian: (p: { x: number; y: number; z: number }) => ({
+        longitude: p.x,
+        latitude: p.y,
+        height: p.z,
+      }),
+    };
+    cesium.PolygonHierarchy = class {
+      constructor(
+        public positions: unknown[],
+        public holes: unknown[] = [],
+      ) {}
+    };
+    const load = f.Cesium.GeoJsonDataSource.load;
+    f.Cesium.GeoJsonDataSource.load = async (data, options) => {
+      const ds = await load(data, options);
+      for (const entity of ds.entities.values as Array<{ polygon?: Record<string, unknown> }>) {
+        if (entity.polygon?.perPositionHeight) {
+          entity.polygon.hierarchy = {
+            getValue: () => ({
+              positions: [
+                { x: 0, y: 0, z: 100 },
+                { x: 1, y: 0, z: 100 },
+              ],
+              holes: [{ positions: [{ x: 0.5, y: 0.2, z: 100 }], holes: [] }],
+            }),
+          };
+        }
+      }
+      return ds;
+    };
+    let zoom = 16;
+    const sync = newSync(f, () => zoom);
+    sync.sync([
+      mkLayer({
+        id: "zoom-base-z",
+        type: "geojson",
+        geojson: {
+          type: "FeatureCollection",
+          features: [
+            {
+              type: "Feature",
+              properties: { top: 10 },
+              geometry: {
+                type: "Polygon",
+                coordinates: [
+                  [
+                    [0, 0, 100],
+                    [1, 0, 100],
+                    [1, 1, 100],
+                    [0, 0, 100],
+                  ],
+                ],
+              },
+            },
+          ],
+        },
+        style: {
+          extrusionEnabled: true,
+          extrusionHeightProperty: "top",
+          extrusionAdvancedStyleEnabled: true,
+          extrusionBaseExpression: '["step", ["zoom"], 0, 15, 5, 17, 8]',
+        },
+      }),
+    ]);
+    await f.flush();
+    type Hier = { positions: Array<{ z: number }>; holes: Hier[] };
+    const ds = f.calls.dataSourcesAdded[0] as {
+      entities: { values: Array<{ polygon?: { hierarchy?: { value?: Hier } } }> };
+    };
+    const heights = () => {
+      const h = ds.entities.values.find((e) => e.polygon)?.polygon?.hierarchy;
+      const value = (
+        h && "value" in h ? h.value : (h as { getValue: () => Hier }).getValue()
+      ) as Hier;
+      return [...value.positions.map((p) => p.z), ...value.holes[0].positions.map((p) => p.z)];
+    };
+    // Base 5 at zoom 16, holes included.
+    assert.deepEqual(heights(), [105, 105, 105]);
+    // Base 8 at zoom 17.5: offset from the loaded 100 m, not stacked on 105.
+    zoom = 17.5;
+    for (const listener of [...f.calls.moveEndListeners]) listener();
+    assert.deepEqual(heights(), [108, 108, 108]);
+    // Base back to 0: the loaded vertices are restored.
+    zoom = 14;
+    for (const listener of [...f.calls.moveEndListeners]) listener();
+    assert.deepEqual(heights(), [100, 100, 100]);
+  });
+
+  it("evaluates zoom-dependent extrusion heights at the fractional camera zoom (#3346)", async () => {
+    let zoom = 5.25;
+    const sync = newSync(f, () => zoom);
+    const ramp = '["interpolate", ["linear"], ["zoom"], 0, 10, 10, 30]';
+    sync.sync([
+      mkLayer({
+        id: "ramp",
+        type: "geojson",
+        geojson: {
+          type: "FeatureCollection",
+          features: [
+            {
+              type: "Feature",
+              properties: {},
+              geometry: {
+                type: "Polygon",
+                coordinates: [
+                  [
+                    [0, 0],
+                    [1, 0],
+                    [1, 1],
+                    [0, 0],
+                  ],
+                ],
+              },
+            },
+          ],
+        },
+        style: {
+          extrusionEnabled: true,
+          extrusionAdvancedStyleEnabled: true,
+          extrusionHeightExpression: ramp,
+        },
+      }),
+    ]);
+    await f.flush();
+    const ds = f.calls.dataSourcesAdded[0] as {
+      entities: {
+        values: Array<{ polygon?: { extrudedHeight?: { value: number } } }>;
+      };
+    };
+    const polygon = () => ds.entities.values.find((e) => e.polygon)?.polygon;
+    // Not floored to zoom 5 (20 m), nor evaluated at zoom 0 (10 m).
+    assert.equal(polygon()?.extrudedHeight?.value, 20.5);
+
+    // Mid-flight `changed` events leave the extrusion alone: each changed
+    // height rebuilds the polygon, so it waits for the camera to settle.
+    zoom = 5.75;
+    const written = polygon()?.extrudedHeight;
+    for (const listener of [...f.calls.changedListeners]) listener();
+    assert.equal(polygon()?.extrudedHeight, written);
+
+    // The camera settles at the new zoom: the moveEnd listener re-runs it.
+    for (const listener of [...f.calls.moveEndListeners]) listener();
+    assert.equal(polygon()?.extrudedHeight?.value, 21.5);
+    assert.notEqual(polygon()?.extrudedHeight, written);
+
+    // Settling again at the same zoom writes nothing.
+    const settled = polygon()?.extrudedHeight;
+    for (const listener of [...f.calls.moveEndListeners]) listener();
+    assert.equal(polygon()?.extrudedHeight, settled);
+  });
+
+  it("keeps a selected polygon's highlight through a zoom extrusion pass (#3346)", async () => {
+    let zoom = 14.2;
+    const sync = newSync(f, () => zoom);
+    sync.sync([
+      mkLayer({
+        id: "sel",
+        type: "geojson",
+        geojson: {
+          type: "FeatureCollection",
+          features: [
+            {
+              type: "Feature",
+              id: "b1",
+              properties: {},
+              geometry: {
+                type: "Polygon",
+                coordinates: [
+                  [
+                    [0, 0],
+                    [1, 0],
+                    [1, 1],
+                    [0, 0],
+                  ],
+                ],
+              },
+            },
+          ],
+        },
+        style: {
+          extrusionEnabled: true,
+          extrusionAdvancedStyleEnabled: true,
+          extrusionHeightExpression: '["step", ["zoom"], 0, 15, 40]',
+          extrusionColorExpression: '["step", ["zoom"], "#ff0000", 15, "#00ff00"]',
+        },
+      }),
+    ]);
+    await f.flush();
+    type Poly = {
+      extrudedHeight?: { value: number };
+      material?: { color?: { css?: string } };
+    };
+    const ds = f.calls.dataSourcesAdded[0] as { entities: { values: Array<{ polygon?: Poly }> } };
+    const polygon = () => ds.entities.values.find((e) => e.polygon)?.polygon;
+
+    // Give the fake graphics the clone() the selection highlight uses.
+    const withClone = (g: Record<string, unknown>): Record<string, unknown> =>
+      Object.assign(g, { clone: () => withClone({ ...g }) });
+    for (const entity of ds.entities.values as Array<Record<string, unknown>>) {
+      for (const key of ["polygon", "polyline", "billboard", "point"]) {
+        const graphics = entity[key] as Record<string, unknown> | undefined;
+        if (graphics) withClone(graphics);
+      }
+    }
+
+    sync.highlight("sel", ["b1"]);
+    assert.equal(polygon()?.material?.color?.css, "#facc15");
+
+    // Crossing the stop while selected: the new height shows, and the
+    // highlight stays on instead of being replaced by the expression colour.
+    zoom = 15.5;
+    for (const listener of [...f.calls.moveEndListeners]) listener();
+    assert.equal(polygon()?.extrudedHeight?.value, 40);
+    assert.equal(polygon()?.material?.color?.css, "#facc15");
+
+    // Deselecting restores the polygon the pass wrote, not the pre-zoom one.
+    sync.highlight(undefined, []);
+    assert.equal(polygon()?.extrudedHeight?.value, 40);
+    assert.equal(polygon()?.material?.color?.css, "rgba(0,255,0,1)");
+  });
+
+  describe("zoom extrusion pass after a partial failure (#3346)", () => {
+    const square = (k: number) => ({
+      type: "Feature" as const,
+      properties: { k },
+      geometry: {
+        type: "Polygon" as const,
+        coordinates: [
+          [
+            [0, 0],
+            [1, 0],
+            [1, 1],
+            [0, 0],
+          ],
+        ],
+      },
+    });
+    type Poly = { extrudedHeight?: { value: number } };
+    const heights = (ds: unknown) =>
+      (ds as { entities: { values: Array<{ polygon?: Poly }> } }).entities.values
+        .filter((e) => e.polygon)
+        .map((e) => e.polygon?.extrudedHeight?.value);
+    /** Make `new ConstantProperty(value)` throw for values `failOn` accepts. */
+    const failConstantProperty = (failOn: (value: unknown) => boolean) => {
+      f.Cesium.ConstantProperty = class {
+        constructor(public value: unknown) {
+          if (failOn(value)) throw new Error("write failed");
+        }
+      };
+    };
+    const quietly = (run: () => void) => {
+      const warn = console.warn;
+      console.warn = () => {};
+      try {
+        run();
+      } finally {
+        console.warn = warn;
+      }
+    };
+    const settle = () => {
+      for (const listener of [...f.calls.moveEndListeners]) listener();
+    };
+
+    it("reconciles an entity that updated before a later one threw", async () => {
+      let zoom = 14;
+      const sync = newSync(f, () => zoom);
+      sync.sync([
+        mkLayer({
+          id: "partial-layer",
+          type: "geojson",
+          geojson: { type: "FeatureCollection", features: [square(1), square(2)] },
+          style: {
+            extrusionEnabled: true,
+            extrusionAdvancedStyleEnabled: true,
+            extrusionHeightExpression: '["*", ["get", "k"], ["zoom"]]',
+          },
+        }),
+      ]);
+      await f.flush();
+      const ds = f.calls.dataSourcesAdded[0];
+      assert.deepEqual(heights(ds), [14, 28]);
+
+      // At zoom 15 the first polygon takes 15 m, then the second's write throws.
+      failConstantProperty((value) => value === 30);
+      zoom = 15;
+      quietly(settle);
+      assert.deepEqual(heights(ds), [15, 28]);
+
+      // Back at zoom 14 the layer is not skipped as already done at 14.
+      failConstantProperty(() => false);
+      zoom = 14;
+      settle();
+      assert.deepEqual(heights(ds), [14, 28]);
+    });
+
+    it("rewrites an entity whose write threw after its roof was set", async () => {
+      let zoom = 14;
+      const sync = newSync(f, () => zoom);
+      sync.sync([
+        mkLayer({
+          id: "partial-entity",
+          type: "geojson",
+          geojson: { type: "FeatureCollection", features: [square(1)] },
+          style: {
+            extrusionEnabled: true,
+            extrusionAdvancedStyleEnabled: true,
+            extrusionHeightExpression: '["zoom"]',
+            extrusionBaseExpression: '["step", ["zoom"], 0, 15, 2]',
+          },
+        }),
+      ]);
+      await f.flush();
+      const ds = f.calls.dataSourcesAdded[0];
+      assert.deepEqual(heights(ds), [14]);
+
+      // At zoom 15 the roof (15 m) is written, then the base (2 m) write throws.
+      failConstantProperty((value) => value === 2);
+      zoom = 15;
+      quietly(settle);
+      assert.deepEqual(heights(ds), [15]);
+
+      // Back at zoom 14 its old record no longer matches, so the roof returns to 14 m.
+      failConstantProperty(() => false);
+      zoom = 14;
+      settle();
+      assert.deepEqual(heights(ds), [14]);
+    });
+  });
+
+  it("does not rebuild a step-zoom extrusion until the zoom crosses a stop (#3346)", async () => {
+    let zoom = 14.2;
+    const sync = newSync(f, () => zoom);
+    sync.sync([
+      mkLayer({
+        id: "step",
+        type: "geojson",
+        geojson: {
+          type: "FeatureCollection",
+          features: [
+            {
+              type: "Feature",
+              properties: {},
+              geometry: {
+                type: "Polygon",
+                coordinates: [
+                  [
+                    [0, 0],
+                    [1, 0],
+                    [1, 1],
+                    [0, 0],
+                  ],
+                ],
+              },
+            },
+          ],
+        },
+        style: {
+          extrusionEnabled: true,
+          extrusionAdvancedStyleEnabled: true,
+          extrusionHeightExpression: '["step", ["zoom"], 0, 15, 40]',
+        },
+      }),
+    ]);
+    await f.flush();
+    const ds = f.calls.dataSourcesAdded[0] as {
+      entities: {
+        values: Array<{ polygon?: { extrudedHeight?: { value: number } } }>;
+      };
+    };
+    const polygon = () => ds.entities.values.find((e) => e.polygon)?.polygon;
+    assert.equal(polygon()?.extrudedHeight?.value, 0);
+    const first = polygon()?.extrudedHeight;
+    zoom = 14.8;
+    for (const listener of [...f.calls.moveEndListeners]) listener();
+    assert.equal(polygon()?.extrudedHeight, first);
+    zoom = 15.1;
+    for (const listener of [...f.calls.moveEndListeners]) listener();
+    assert.equal(polygon()?.extrudedHeight?.value, 40);
   });
 
   it("re-alphas an expression-coloured extrusion through the material's colour Property", async () => {

@@ -43,7 +43,11 @@ import {
   applyI3sBuildingVisibility,
 } from "./cesium-layer-entry";
 import { styleSignature } from "./cesium-layer-rebuild";
-import { FEATURE_INDEX_KEY } from "./cesium-geojson-entities";
+import {
+  FEATURE_INDEX_KEY,
+  applyGeoJsonExtrusion,
+  entityHeightWriters,
+} from "./cesium-geojson-entities";
 import { CesiumLayerSyncSelection } from "./cesium-layer-sync-selection";
 
 type CesiumNs = typeof import("@cesium/engine");
@@ -66,17 +70,22 @@ export class CesiumLayerSyncAppearance extends CesiumLayerSyncSelection {
   /** Removes the camera listeners installed by {@link watchCameraZoom}, or null when none are. */
   protected unwatchCamera: (() => void) | null = null;
 
+  /** Layers whose zoom extrusion refresh already logged a failure. */
+  private readonly extrusionFailureWarned = new Set<string>();
+
   /**
    * Keep camera listeners installed exactly while some entry's filter reads
    * `["zoom"]`. MapLibre evaluates such a filter live; on the globe the filter
    * is re-run when the camera settles (`moveEnd`) or moves far enough to fire
    * `changed`, and {@link applyGeoJsonFilter} skips the work unless the integer
-   * zoom actually crossed a level.
+   * zoom actually crossed a level. A zoom-dependent extrusion is re-run only
+   * when the camera settles, at the fractional zoom (see
+   * {@link reapplyZoomExtrusions}).
    */
   protected watchCameraZoom(): void {
     let wanted = false;
     for (const entry of this.entries.values()) {
-      if (entry.zoomFilter || entry.zoomStyle || entry.zoomCluster) {
+      if (entry.zoomFilter || entry.zoomStyle || entry.zoomCluster || entry.zoomExtrusion) {
         wanted = true;
         break;
       }
@@ -90,13 +99,113 @@ export class CesiumLayerSyncAppearance extends CesiumLayerSyncSelection {
     const camera = this.viewer.camera as
       | { moveEnd?: CameraEvent; changed?: CameraEvent }
       | undefined;
-    const events = [camera?.moveEnd, camera?.changed].filter((e): e is CameraEvent => Boolean(e));
-    if (events.length === 0) return;
+    const moveEnd = camera?.moveEnd;
+    const changed = camera?.changed;
+    if (!moveEnd && !changed) return;
     const onMove = () => this.reapplyZoomFilters();
-    for (const event of events) event.addEventListener(onMove);
-    this.unwatchCamera = () => {
-      for (const event of events) event.removeEventListener(onMove);
+    const onSettle = () => {
+      this.reapplyZoomFilters();
+      this.reapplyZoomExtrusions();
     };
+    changed?.addEventListener(onMove);
+    moveEnd?.addEventListener(onSettle);
+    this.unwatchCamera = () => {
+      changed?.removeEventListener(onMove);
+      moveEnd?.removeEventListener(onSettle);
+    };
+  }
+
+  /**
+   * An extruded polygon's alpha: the extrusion opacity (0.8 when unset) times
+   * the layer's effective opacity. The load, restyle and zoom passes share it,
+   * so the colour key the zoom pass compares cannot drift between them.
+   */
+  protected extrusionAlpha(entry: LayerEntry): number {
+    const style = entry.layer.style ?? {};
+    const own = Number.isFinite(style.extrusionOpacity) ? (style.extrusionOpacity as number) : 0.8;
+    return own * this.effectiveOpacity(entry);
+  }
+
+  /**
+   * Re-evaluate every zoom-dependent extrusion at the camera's fractional
+   * zoom, as MapLibre evaluates `fill-extrusion-*` (#3346). It runs when the
+   * camera settles rather than per frame, since every changed height rebuilds
+   * that polygon's geometry; {@link applyGeoJsonExtrusion} only writes the
+   * entities whose height, base or colour actually changed, so a step
+   * expression rebuilds nothing until the zoom crosses a stop.
+   */
+  private reapplyZoomExtrusions(): void {
+    const zoom = this.cameraZoomExact();
+    const stale = [...this.entries.values()].filter(
+      (entry) =>
+        entry.kind === "geojson" &&
+        entry.zoomExtrusion &&
+        entry.handle &&
+        entry.extrusionZoom !== zoom,
+    );
+    if (stale.length === 0) return;
+    // A selected polygon is a highlighted clone whose restorer reinstates the
+    // pre-highlight original. Take the highlight off first so the pass writes
+    // the polygon the entity keeps (and its record matches it), then put it
+    // back, cloned from the updated polygon, as the load path does.
+    this.restoreHighlight();
+    let changed = false;
+    try {
+      changed = this.runZoomExtrusions(stale, zoom);
+    } finally {
+      this.applyHighlight();
+    }
+    if (changed) this.viewer.scene?.requestRender?.();
+  }
+
+  /** The extrusion pass behind {@link reapplyZoomExtrusions}; returns whether any entity changed. */
+  private runZoomExtrusions(stale: LayerEntry[], zoom: number): boolean {
+    let changed = false;
+    for (const entry of stale) {
+      const dataSource = entry.handle as DataSource;
+      const style = entry.layer.style ?? {};
+      const extOpacity = this.extrusionAlpha(entry);
+      // One definition-change event for the whole pass (#2311).
+      (dataSource.entities as { suspendEvents?: () => void }).suspendEvents?.();
+      try {
+        if (
+          applyGeoJsonExtrusion(
+            this.Cesium,
+            this.viewer,
+            dataSource,
+            style,
+            // Always set with zoomExtrusion; never fall back to the untransformed
+            // features, which would be wrong for a Z or elevated layer.
+            entry.extrusionFeatures ?? [],
+            extOpacity,
+            entityHeightWriters(this.Cesium, this.viewer),
+            zoom,
+          )
+        ) {
+          changed = true;
+        }
+        // Recorded only after a pass that completed, so a failed one is
+        // retried on the next settle.
+        entry.extrusionZoom = zoom;
+      } catch (error) {
+        // The pass may have written some entities before it threw, so render.
+        changed = true;
+        // Some entities may already hold this zoom's values, so forget the
+        // last completed zoom: the next settle, even back at that zoom,
+        // reconciles them rather than skipping the layer.
+        entry.extrusionZoom = undefined;
+        // One layer's failure must not escape the moveEnd listener, which
+        // Cesium does not isolate from the camera's other listeners. Warn once
+        // per layer: a persistently failing layer retries on every settle.
+        if (!this.extrusionFailureWarned.has(entry.layer.id)) {
+          this.extrusionFailureWarned.add(entry.layer.id);
+          console.warn(`[GeoLibre] Cesium extrusion refresh failed for ${entry.layer.id}`, error);
+        }
+      } finally {
+        (dataSource.entities as { resumeEvents?: () => void }).resumeEvents?.();
+      }
+    }
+    return changed;
   }
 
   /**
@@ -773,9 +882,7 @@ export class CesiumLayerSyncAppearance extends CesiumLayerSyncSelection {
     if (!dataSource) return;
     const style = entry.layer.style ?? {};
     const opacity = this.effectiveOpacity(entry);
-    const extOpacity =
-      (Number.isFinite(style.extrusionOpacity) ? (style.extrusionOpacity as number) : 0.8) *
-      opacity;
+    const extOpacity = this.extrusionAlpha(entry);
     const resolver = this.resolverFor(entry);
     const zoom = resolver.zoomDependent ? this.cameraZoom() : 0;
     // Any opacity change, any style-object change (the in-place fields), and a

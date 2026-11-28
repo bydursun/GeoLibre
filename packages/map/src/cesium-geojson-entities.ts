@@ -165,47 +165,171 @@ function ringTopAltitude(feature: Feature | null): number {
   return Number.isFinite(top) ? top : 0;
 }
 
+/** Whether a serialized expression reads `["zoom"]`. */
+const ZOOM_OPERAND = /\[\s*"zoom"\s*\]/;
+
+/** A compiled per-feature extrusion expression, evaluated at a camera zoom. */
+type ExtrusionEvaluator = (f: Feature, zoom: number) => unknown;
+
+/** The compiled extrusion expressions {@link compileExtrusionEvaluators} returns. */
+interface ExtrusionEvaluators {
+  heightEvaluator: ExtrusionEvaluator | undefined;
+  baseEvaluator: ExtrusionEvaluator | undefined;
+  colorEvaluator: ExtrusionEvaluator | undefined;
+  zoomDependent: boolean;
+}
+
+/**
+ * Compiled evaluators keyed by the expression sources they were built from,
+ * so a settle-time re-run reuses them and an in-place style edit can never be
+ * served stale ones. Bounded: cleared when it grows past a handful of styles.
+ */
+const compiledExtrusions = new Map<string, ExtrusionEvaluators>();
+const MAX_COMPILED_EXTRUSIONS = 64;
+
 /**
  * The extrusion's optional per-feature height, base and colour expressions,
- * compiled once per layer; each is undefined when unset or invalid.
+ * compiled once per distinct set of sources; each is undefined when unset or invalid.
+ * `zoomDependent` is true when any compiled one reads `["zoom"]`, so the
+ * extrusion has to be re-run as the camera zooms (#3346).
  */
 function compileExtrusionEvaluators(
   style: LayerStyle,
   extColorVal: ReturnType<typeof extrusionColorValue>,
   baseVal: ReturnType<typeof extrusionBaseValue>,
-): {
-  heightEvaluator: ((f: Feature) => unknown) | undefined;
-  baseEvaluator: ((f: Feature) => unknown) | undefined;
-  colorEvaluator: ((f: Feature) => unknown) | undefined;
-} {
-  let heightEvaluator: ((f: Feature) => unknown) | undefined;
-  if (style.extrusionAdvancedStyleEnabled && style.extrusionHeightExpression) {
-    const res = compileFeatureExpression(style.extrusionHeightExpression, {
-      expectedType: "number",
-    });
-    if (res.ok && res.evaluate) heightEvaluator = res.evaluate;
-  }
-
-  let colorEvaluator: ((f: Feature) => unknown) | undefined;
+): ExtrusionEvaluators {
+  const heightSource =
+    style.extrusionAdvancedStyleEnabled && style.extrusionHeightExpression
+      ? style.extrusionHeightExpression
+      : "";
   let colorExprStr: string | null = null;
   if (typeof extColorVal !== "string") {
     colorExprStr = JSON.stringify(extColorVal);
   } else if (style.extrusionAdvancedStyleEnabled && style.extrusionColorExpression) {
     colorExprStr = style.extrusionColorExpression;
   }
-  if (colorExprStr) {
-    const res = compileFeatureExpression(colorExprStr, {
-      expectedType: "color",
-    });
-    if (res.ok && res.evaluate) colorEvaluator = res.evaluate;
-  }
+  const baseSource = Array.isArray(baseVal) ? JSON.stringify(baseVal) : "";
+  const cacheKey = JSON.stringify([heightSource, colorExprStr ?? "", baseSource]);
+  const cached = compiledExtrusions.get(cacheKey);
+  if (cached) return cached;
+  let zoomDependent = false;
+  const compile = (
+    source: string,
+    expectedType: "number" | "color",
+  ): ExtrusionEvaluator | undefined => {
+    const res = compileFeatureExpression(source, { expectedType });
+    if (!res.ok || !res.evaluate) return undefined;
+    if (ZOOM_OPERAND.test(source)) zoomDependent = true;
+    return res.evaluate;
+  };
 
-  let baseEvaluator: ((f: Feature) => unknown) | undefined;
-  if (Array.isArray(baseVal)) {
-    const res = compileFeatureExpression(JSON.stringify(baseVal), { expectedType: "number" });
-    if (res.ok && res.evaluate) baseEvaluator = res.evaluate;
+  const heightEvaluator = heightSource ? compile(heightSource, "number") : undefined;
+  const colorEvaluator = colorExprStr ? compile(colorExprStr, "color") : undefined;
+  const baseEvaluator = baseSource ? compile(baseSource, "number") : undefined;
+  const compiled = { heightEvaluator, baseEvaluator, colorEvaluator, zoomDependent };
+  if (compiledExtrusions.size >= MAX_COMPILED_EXTRUSIONS) compiledExtrusions.clear();
+  compiledExtrusions.set(cacheKey, compiled);
+  return compiled;
+}
+
+/** Whether a layer's Cesium extrusion reads `["zoom"]` in its height, base or colour. */
+export function extrusionIsZoomDependent(style: LayerStyle): boolean {
+  if (!style.extrusionEnabled) return false;
+  return compileExtrusionEvaluators(style, extrusionColorValue(style), extrusionBaseValue(style))
+    .zoomDependent;
+}
+
+/** The values {@link applyGeoJsonExtrusion} last wrote to an entity. */
+interface AppliedExtrusion {
+  extrudedHeight: number;
+  base: number;
+  colorKey: string;
+}
+
+/** Per-entity record of the last extrusion write, so a re-run skips unchanged entities. */
+const appliedExtrusions = new WeakMap<Entity, AppliedExtrusion>();
+
+/** A polygon's hierarchy as the data source loaded it, before any base offset. */
+const loadedHierarchies = new WeakMap<Entity, unknown>();
+
+interface HierarchyLike {
+  positions?: unknown[];
+  holes?: HierarchyLike[];
+}
+
+/** The Cesium members {@link offsetHierarchy} uses (any may be absent in a stub). */
+interface HierarchyGeodesy {
+  Cartographic?: {
+    fromCartesian?: (p: unknown) => { longitude: number; latitude: number; height: number };
+  };
+  Cartesian3?: { fromRadians?: (lon: number, lat: number, h: number) => unknown };
+  PolygonHierarchy?: new (positions: unknown[], holes: unknown[]) => HierarchyLike;
+}
+
+/**
+ * Raise every vertex of a polygon hierarchy by `offset` metres along the
+ * ellipsoid normal (holes included). Returns null when Cesium lacks the
+ * geodesy helpers or the hierarchy has no positions.
+ */
+function offsetHierarchy(
+  Cesium: CesiumNs,
+  hierarchy: HierarchyLike,
+  offset: number,
+): HierarchyLike | null {
+  const { Cartographic, Cartesian3, PolygonHierarchy } = Cesium as unknown as HierarchyGeodesy;
+  if (!Cartographic?.fromCartesian || !Cartesian3?.fromRadians || !PolygonHierarchy) return null;
+  const fromCartesian = Cartographic.fromCartesian;
+  const fromRadians = Cartesian3.fromRadians;
+  const lift = (h: HierarchyLike): HierarchyLike | null => {
+    if (!Array.isArray(h.positions)) return null;
+    const positions = h.positions.map((p) => {
+      const c = fromCartesian(p);
+      return fromRadians(c.longitude, c.latitude, c.height + offset);
+    });
+    // A hole that cannot be lifted fails the whole hierarchy: dropping it
+    // would fill the hole and still record the base as applied.
+    const holes: HierarchyLike[] = [];
+    for (const hole of h.holes ?? []) {
+      const lifted = lift(hole);
+      if (!lifted) return null;
+      holes.push(lifted);
+    }
+    return new PolygonHierarchy(positions, holes);
+  };
+  return lift(hierarchy);
+}
+
+/**
+ * Move the floor of a polygon with Z coordinates (`perPositionHeight`) up by
+ * the resolved base. Cesium takes each vertex's own height as the floor there
+ * and ignores `polygon.height`, so the base is added to the vertices
+ * themselves; the hierarchy as loaded is kept so a later pass (a zoom step, a
+ * restyle) offsets from it rather than stacking offsets. Returns false when
+ * the floor could not be moved (no hierarchy, or Cesium lacks the geodesy
+ * helpers), so the caller does not record the base as applied.
+ */
+function applyPerPositionBase(
+  Cesium: CesiumNs,
+  viewer: CesiumWidget,
+  entity: Entity,
+  base: number,
+  makeProp: (v: unknown) => unknown,
+): boolean {
+  const polygon = entity.polygon as { hierarchy?: unknown } | undefined;
+  if (!polygon) return false;
+  if (!loadedHierarchies.has(entity)) {
+    if (base === 0) return true;
+    const prop = polygon.hierarchy as { getValue?: (time: unknown) => unknown } | undefined;
+    const value =
+      prop && typeof prop.getValue === "function" ? prop.getValue(viewer.clock?.currentTime) : prop;
+    if (!value || typeof value !== "object") return false;
+    loadedHierarchies.set(entity, value);
   }
-  return { heightEvaluator, baseEvaluator, colorEvaluator };
+  const loaded = loadedHierarchies.get(entity) as HierarchyLike;
+  const next = base === 0 ? loaded : offsetHierarchy(Cesium, loaded, base);
+  if (!next) return false;
+  polygon.hierarchy = makeProp(next);
+  return true;
 }
 
 /**
@@ -214,6 +338,12 @@ function compileExtrusionEvaluators(
  * property or expression), its colour from the colour expression or the flat
  * extrusion colour, faded by the extrusion opacity. As on the 2D map the
  * height is the roof's altitude, not a thickness above the base.
+ *
+ * Expressions are evaluated at `zoom`, the camera's fractional MapLibre zoom,
+ * so `["zoom"]` steps and interpolations resolve as the 2D map paints them.
+ * An entity whose values did not change since the last pass is left alone, so
+ * a re-run after a camera move only rebuilds the polygons that moved.
+ * Returns whether any entity was written.
  */
 export function applyGeoJsonExtrusion(
   Cesium: CesiumNs,
@@ -223,7 +353,8 @@ export function applyGeoJsonExtrusion(
   features: FeatureCollection["features"],
   extOpacity: number,
   writers: EntityHeightWriters,
-): void {
+  zoom: number,
+): boolean {
   const { heightRef, makeProp, makeMat, perPositionHeight } = writers;
   const heightProp = style.extrusionHeightProperty?.trim() || "height";
   const heightScale = Number.isFinite(style.extrusionHeightScale)
@@ -250,6 +381,10 @@ export function applyGeoJsonExtrusion(
   // Parsed once: a full 3D-buildings layer would otherwise re-parse the
   // same CSS string per polygon. withAlpha() below returns a fresh Color.
   const baseColor = Cesium.Color.fromCssColorString(extColorStr);
+  // Expression colours parsed once per distinct value in this pass: a
+  // classified building layer resolves thousands of features to a few colours.
+  const parsedColors = new Map<string, Color | undefined>();
+  let changed = false;
   for (const entity of dataSource.entities.values) {
     if (!entity.polygon) continue;
     const index = entityFeatureIndex(viewer, entity);
@@ -262,8 +397,9 @@ export function applyGeoJsonExtrusion(
       heightEvaluator,
       heightProp,
       heightScale,
+      zoom,
     );
-    const base = extrusionFeatureBase(feat, baseEvaluator, flatBase);
+    const base = extrusionFeatureBase(feat, baseEvaluator, flatBase, zoom);
     // A floor height makes the roof relative to this feature's base, as
     // `extrusionHeightValue` does on the 2D map.
     const roof = floorHeight > 0 ? base + floorHeight : top;
@@ -271,25 +407,65 @@ export function applyGeoJsonExtrusion(
     // Never below the base: a negative height property or expression would
     // otherwise put the roof under the floor.
     const relativeTop = Math.max(base, roof);
+    const perPosition = perPositionHeight(entity.polygon);
     // With perPositionHeight Cesium takes each vertex's own height as the
-    // base (so neither a flat nor a data-driven base moves the floor of a
-    // polygon with Z coordinates) but reads extrudedHeight as an absolute
-    // altitude, so lift the roof by the ring's highest vertex; otherwise it
-    // would extrude down to `relativeTop` metres above the ellipsoid.
-    const extrudedHeight = perPositionHeight(entity.polygon)
-      ? ringTopAltitude(feat) + relativeTop
-      : relativeTop;
+    // floor and ignores `height`, so the base is added to the vertices
+    // (applyPerPositionBase); it reads extrudedHeight as an absolute
+    // altitude, so the roof is lifted by the ring's highest vertex rather
+    // than extruding down to `relativeTop` metres above the ellipsoid.
+    const extrudedHeight = perPosition ? ringTopAltitude(feat) + relativeTop : relativeTop;
 
-    const resolvedColor = extrusionFeatureColor(Cesium, baseColor, feat, colorEvaluator);
+    const { color: resolvedColor, key: colorKey } = extrusionFeatureColor(
+      Cesium,
+      baseColor,
+      feat,
+      colorEvaluator,
+      zoom,
+      parsedColors,
+    );
+    // The flat colour stands in for an expression's, so a flat-colour edit is
+    // never skipped as unchanged.
+    const fullColorKey = `${colorKey || extColorStr}|${extOpacity}`;
 
+    const previous = appliedExtrusions.get(entity);
+    if (
+      previous &&
+      previous.extrudedHeight === extrudedHeight &&
+      previous.base === base &&
+      previous.colorKey === fullColorKey
+    ) {
+      continue;
+    }
+
+    // Drop the old record before writing: if a write below throws, a later
+    // pass (even back at the previous values) must not match a record the
+    // entity no longer reflects.
+    appliedExtrusions.delete(entity);
     entity.polygon.extrudedHeight = makeProp(extrudedHeight) as never;
-    if (!perPositionHeight(entity.polygon)) {
+    let appliedBase = base;
+    if (perPosition) {
+      if (
+        (!previous || previous.base !== base) &&
+        !applyPerPositionBase(Cesium, viewer, entity, base, makeProp)
+      ) {
+        // The floor did not move: record that, so the next pass tries again
+        // rather than treating this base as already applied.
+        appliedBase = Number.NaN;
+      }
+    } else {
       entity.polygon.height = makeProp(base) as never;
       entity.polygon.heightReference = makeProp(heightRef) as never;
       entity.polygon.extrudedHeightReference = makeProp(heightRef) as never;
     }
-    entity.polygon.material = makeMat(resolvedColor.withAlpha(extOpacity)) as never;
+    if (!previous || previous.colorKey !== fullColorKey) {
+      entity.polygon.material = makeMat(resolvedColor.withAlpha(extOpacity)) as never;
+    }
+    // Recorded only once every write landed, so a throw part-way leaves the
+    // entity to be retried rather than skipped as up to date.
+    appliedExtrusions.set(entity, { extrudedHeight, base: appliedBase, colorKey: fullColorKey });
+    changed = true;
   }
+  return changed;
 }
 
 /**
@@ -303,15 +479,16 @@ function extrusionFeatureHeight(
   viewer: CesiumWidget,
   entity: Entity,
   feat: Feature | null,
-  heightEvaluator: ((f: Feature) => unknown) | undefined,
+  heightEvaluator: ExtrusionEvaluator | undefined,
   heightProp: string,
   heightScale: number,
+  zoom: number,
 ): number {
   let rawHeight: unknown;
   let scale = heightScale;
   if (feat && heightEvaluator) {
     try {
-      rawHeight = heightEvaluator(feat);
+      rawHeight = heightEvaluator(feat, zoom);
       scale = 1;
     } catch {
       rawHeight = feat.properties?.[heightProp];
@@ -337,42 +514,53 @@ function extrusionFeatureHeight(
  */
 function extrusionFeatureBase(
   feat: Feature | null,
-  baseEvaluator: ((f: Feature) => unknown) | undefined,
+  baseEvaluator: ExtrusionEvaluator | undefined,
   flatBase: number,
+  zoom: number,
 ): number {
   if (!feat || !baseEvaluator) return flatBase;
   let value: number;
   try {
-    value = Number(baseEvaluator(feat));
+    value = Number(baseEvaluator(feat, zoom));
   } catch {
     return flatBase;
   }
   return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
-/** A polygon entity's extrusion colour: the colour expression's, else `baseColor`. */
+/**
+ * A polygon entity's extrusion colour: the colour expression's, else
+ * `baseColor`. `key` identifies the colour so a re-run can tell whether it
+ * changed (empty for the base colour).
+ */
 function extrusionFeatureColor(
   Cesium: CesiumNs,
   baseColor: Color,
   feat: Feature | null,
-  colorEvaluator: ((f: Feature) => unknown) | undefined,
-): Color {
-  let resolvedColor = baseColor;
+  colorEvaluator: ExtrusionEvaluator | undefined,
+  zoom: number,
+  parsedColors: Map<string, Color | undefined>,
+): { color: Color; key: string } {
   if (feat && colorEvaluator) {
     try {
-      const colVal = colorEvaluator(feat);
-      if (typeof colVal === "string") {
-        resolvedColor = Cesium.Color.fromCssColorString(colVal);
-      } else if (colVal && typeof (colVal as { toString?: () => string }).toString === "function") {
-        resolvedColor = Cesium.Color.fromCssColorString(
-          (colVal as { toString: () => string }).toString(),
-        );
+      const colVal = colorEvaluator(feat, zoom);
+      const css =
+        typeof colVal === "string"
+          ? colVal
+          : colVal && typeof (colVal as { toString?: () => string }).toString === "function"
+            ? (colVal as { toString: () => string }).toString()
+            : null;
+      if (css) {
+        if (!parsedColors.has(css)) parsedColors.set(css, Cesium.Color.fromCssColorString(css));
+        // fromCssColorString returns undefined for a string it cannot parse.
+        const color = parsedColors.get(css);
+        if (color) return { color, key: css };
       }
     } catch {
-      // fallback to extColorStr
+      // fallback to the base colour
     }
   }
-  return resolvedColor;
+  return { color: baseColor, key: "" };
 }
 
 /**

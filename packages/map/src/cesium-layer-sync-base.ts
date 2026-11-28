@@ -123,6 +123,22 @@ export class CesiumLayerSyncBase {
     }
   }
 
+  /**
+   * The camera's fractional MapLibre zoom, as `fill-extrusion-*` expressions
+   * evaluate on the 2D map (an interpolation between stops is continuous).
+   * Rounded to 0.01: the globe derives zoom from the camera height, so a pan
+   * nudges it by tiny amounts that would otherwise re-run zoom passes for no
+   * visible change.
+   */
+  protected cameraZoomExact(): number {
+    try {
+      const zoom = this.readZoom();
+      return Number.isFinite(zoom) ? Math.round(zoom * 100) / 100 : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   /** Whether the globe draws a terrain surface rather than the bare ellipsoid. */
   protected globeHasTerrain(): boolean {
     const Ellipsoid = this.Cesium.EllipsoidTerrainProvider;

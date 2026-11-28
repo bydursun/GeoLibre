@@ -1,5 +1,6 @@
 // The per-layer entry record CesiumLayerSync keeps for each rendered layer, and helpers over it.
 
+import type { Feature } from "geojson";
 import {
   isCesiumKmlLayer,
   visibleI3sBuildingSublayers,
@@ -151,6 +152,15 @@ export interface LayerEntry {
   cluster?: ReturnType<typeof configureClustering>;
   /** Whether clustering must switch on/off as the camera crosses `clusterMaxZoom`. */
   zoomCluster?: boolean;
+  /**
+   * Whether the extrusion's height, base or colour reads `["zoom"]`, so it is
+   * re-run when the camera settles at a new zoom (#3346).
+   */
+  zoomExtrusion?: boolean;
+  /** The fractional zoom the extrusion was last evaluated at. */
+  extrusionZoom?: number;
+  /** The features the extrusion pass reads (the elevation-transformed copy when Z applies). */
+  extrusionFeatures?: Feature[];
 }
 
 /** Orbit metadata aligned by feature index with a plugin-owned moving point batch. */

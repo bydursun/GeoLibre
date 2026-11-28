@@ -54,6 +54,7 @@ import {
   entityFeatureIndex,
   entityHeightWriters,
   applyGeoJsonExtrusion,
+  extrusionIsZoomDependent,
   applyElevationHeightReferences,
 } from "./cesium-geojson-entities";
 import { CesiumLayerSyncImagery } from "./cesium-layer-sync-imagery";
@@ -503,9 +504,7 @@ export class CesiumLayerSyncEntries extends CesiumLayerSyncImagery {
     // (applyGeoJsonStyle) rather than reloading the whole data source.
     const opacity = this.effectiveOpacity(entry);
     const fillAlpha = (style.fillOpacity ?? 0.6) * opacity;
-    const extOpacity =
-      (Number.isFinite(style.extrusionOpacity) ? (style.extrusionOpacity as number) : 0.8) *
-      opacity;
+    const extOpacity = this.extrusionAlpha(entry);
 
     const has3dElevation = Boolean(
       style.elevation3dEnabled || geojsonHasZCoordinates(layer.geojson),
@@ -568,6 +567,13 @@ export class CesiumLayerSyncEntries extends CesiumLayerSyncImagery {
 
         const writers = entityHeightWriters(Cesium, viewer);
         if (style.extrusionEnabled) {
+          // A zoom-dependent height, base or colour is evaluated at the
+          // camera's zoom now and re-run when the camera settles (#3346).
+          entry.zoomExtrusion = extrusionIsZoomDependent(style);
+          // Only a zoom re-run reads them back; a Z or elevated layer's copy is
+          // a full transformed collection, so don't keep it alive otherwise.
+          entry.extrusionFeatures = entry.zoomExtrusion ? sourceGeoJson.features : undefined;
+          entry.extrusionZoom = entry.zoomExtrusion ? this.cameraZoomExact() : 0;
           applyGeoJsonExtrusion(
             Cesium,
             viewer,
@@ -576,6 +582,7 @@ export class CesiumLayerSyncEntries extends CesiumLayerSyncImagery {
             sourceGeoJson.features,
             extOpacity,
             writers,
+            entry.extrusionZoom,
           );
         }
         // Runs alongside extrusion too: a collection mixing extruded buildings
@@ -601,6 +608,9 @@ export class CesiumLayerSyncEntries extends CesiumLayerSyncImagery {
         return;
       }
       entry.added = true;
+      // sync() installed the camera listeners before this async load knew
+      // whether its extrusion reads ["zoom"].
+      if (entry.zoomExtrusion) this.watchCameraZoom();
 
       this.restoreHighlight();
       this.applyHighlight();
