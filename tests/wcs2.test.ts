@@ -7,6 +7,9 @@ import {
   parseWcsCapabilities,
   parseWcsDescription,
   wcsCoverageUrl,
+  withSubsettingCrsAxes,
+  downloadWithAxisRetry,
+  isWcsRefusal,
   wcsTiffBytes,
   WcsError,
 } from "../apps/geolibre-desktop/src/lib/wcs";
@@ -303,3 +306,111 @@ for (const newline of ["\n", "\r\n"]) {
     assert.deepEqual(wcsTiffBytes(message), raster);
   });
 }
+
+test("offers the subsetting CRS's own axis labels as the one retry (#3727)", () => {
+  // A simulated GeoServer description shaped like TINITALY's (native UTM 32N
+  // with E/N axes, which GeoServer rejects once SUBSETTINGCRS is EPSG:4326 or
+  // EPSG:3857), made by rewriting the captured USGS description.
+  const service = parseWcsCapabilities(fixture("usgs-capabilities.xml").toString())[0];
+  const xml = fixture("usgs-description.xml")
+    .toString()
+    .replaceAll(
+      "http://www.opengis.net/def/crs/EPSG/0/3857",
+      "http://www.opengis.net/def/crs/EPSG/0/32632",
+    )
+    .replace(/axisLabels="x y"/, 'axisLabels="E N"');
+  const info = parseWcsDescription(xml, "DEP3Elevation", service);
+  assert.deepEqual(info.axes, { x: "E", y: "N" });
+  const first = new URL(
+    wcsCoverageUrl(
+      "https://example.org/wcs",
+      "DEP3Elevation",
+      [14.9, 37.65, 15.1, 37.85],
+      64,
+      64,
+      info,
+    ),
+  );
+  // ArcGIS Server and MapServer need the native labels, so they go first.
+  assert.deepEqual(first.searchParams.getAll("SUBSET"), ["E(14.9,15.1)", "N(37.65,37.85)"]);
+  const retry = withSubsettingCrsAxes(info)!;
+  const url = new URL(
+    wcsCoverageUrl(
+      "https://example.org/wcs",
+      "DEP3Elevation",
+      [14.9, 37.65, 15.1, 37.85],
+      64,
+      64,
+      retry,
+    ),
+  );
+  assert.deepEqual(url.searchParams.getAll("SUBSET"), ["Long(14.9,15.1)", "Lat(37.65,37.85)"]);
+  assert.equal(url.searchParams.get("SCALESIZE"), first.searchParams.get("SCALESIZE"));
+  const mercator = withSubsettingCrsAxes({ ...info, crs: "EPSG:3857" })!;
+  assert.deepEqual(mercator.axes, { x: "X", y: "Y" });
+  // No retry in the native CRS, without the CRS extension, or for WCS 1.0.
+  assert.equal(withSubsettingCrsAxes({ ...info, nativeCrs: "EPSG:4326" }), undefined);
+  assert.equal(withSubsettingCrsAxes({ ...info, crsExtension: false }), undefined);
+  assert.equal(withSubsettingCrsAxes({ crs: "EPSG:4326", format: "GeoTIFF" }), undefined);
+  // Labels that already match the CRS need no retry.
+  assert.equal(withSubsettingCrsAxes({ ...info, axes: { x: "Long", y: "Lat" } }), undefined);
+});
+
+test("retries a refusal once with the CRS labels and reports the first refusal (#3727)", async () => {
+  const refusal = new Error("WCS HTTP 404");
+  const exception = new WcsError("response", "InvalidAxisLabel");
+  assert.equal(isWcsRefusal(refusal), true);
+  assert.equal(isWcsRefusal(exception), true);
+  assert.equal(isWcsRefusal(new Error("WCS HTTP 500")), false);
+  assert.equal(isWcsRefusal(new Error("WCS HTTP 429")), false);
+  assert.equal(isWcsRefusal(new Error("WCS HTTP 401")), false);
+  assert.equal(isWcsRefusal(new Error("WCS HTTP 403")), false);
+  assert.equal(isWcsRefusal(new Error("WCS HTTP 400")), true);
+  assert.equal(isWcsRefusal(new WcsError("size")), false);
+  const signal = new AbortController().signal;
+  const stub = (results: Record<string, unknown>) => {
+    const calls: string[] = [];
+    const download = async (url: string) => {
+      calls.push(url);
+      const result = results[url];
+      if (result instanceof Error) throw result;
+      return result as string;
+    };
+    return { calls, download };
+  };
+
+  // Native labels refused, CRS labels accepted.
+  let s = stub({ native: refusal, crs: "tiff" });
+  assert.equal(await downloadWithAxisRetry(s.download, "native", "crs", signal), "tiff");
+  assert.deepEqual(s.calls, ["native", "crs"]);
+
+  // Both refused, or the retry fails some other way: the first refusal wins.
+  for (const retryError of [new Error("WCS HTTP 400"), new Error("timeout")]) {
+    s = stub({ native: refusal, crs: retryError });
+    await assert.rejects(downloadWithAxisRetry(s.download, "native", "crs", signal), refusal);
+  }
+
+  // No retry without an alternative, or for a failure that is not a refusal.
+  s = stub({ native: refusal });
+  await assert.rejects(downloadWithAxisRetry(s.download, "native", undefined, signal), refusal);
+  assert.deepEqual(s.calls, ["native"]);
+  const timeout = new Error("timeout");
+  s = stub({ native: timeout, crs: "tiff" });
+  await assert.rejects(downloadWithAxisRetry(s.download, "native", "crs", signal), timeout);
+  assert.deepEqual(s.calls, ["native"]);
+
+  // An abort skips the retry and surfaces the abort from a retry in flight.
+  const aborted = new AbortController();
+  aborted.abort();
+  s = stub({ native: refusal, crs: "tiff" });
+  await assert.rejects(downloadWithAxisRetry(s.download, "native", "crs", aborted.signal), refusal);
+  assert.deepEqual(s.calls, ["native"]);
+  const midway = new AbortController();
+  const abortError = new DOMException("aborted", "AbortError");
+  const download = async (url: string) => {
+    if (url === "native") throw refusal;
+    midway.abort();
+    throw abortError;
+  };
+  await assert.rejects(downloadWithAxisRetry(download, "native", "crs", midway.signal), abortError);
+});

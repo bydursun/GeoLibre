@@ -8,7 +8,10 @@ import { describeWcs, discoverWcs, downloadWcs } from "../../../../lib/wcs-fetch
 import {
   WCS_CRSES,
   WcsError,
+  downloadWithAxisRetry,
+  isWcsRefusal,
   wcsCoverageUrl,
+  withSubsettingCrsAxes,
   type WcsBounds,
   type WcsCoverage,
   type WcsCrs,
@@ -119,14 +122,19 @@ export function WcsSource({ initialUrl = "" }: { initialUrl?: string }) {
         Number(height),
         description,
       );
-      const file = await downloadWcs(url, coverage, request.signal).catch((error: unknown) => {
+      // Servers disagree on subset axis labels in a non-native CRS, so a
+      // refusal gets one retry with the CRS's own labels (GeoLibre#3727).
+      const crsAxes = withSubsettingCrsAxes(description);
+      const retryUrl =
+        crsAxes && wcsCoverageUrl(endpoint, coverage, area, Number(width), Number(height), crsAxes);
+      const file = await downloadWithAxisRetry(
+        (target) => downloadWcs(target, coverage, request.signal),
+        url,
+        retryUrl,
+        request.signal,
+      ).catch((error: unknown) => {
         // Point at the CRS choice when the server refused one it never listed.
-        // Only a refusal qualifies (an exception report or non-raster body, or
-        // an HTTP 4xx); size, timeout, and conversion failures keep their own
-        // message.
-        const refused =
-          (error instanceof WcsError && error.code === "response") ||
-          (error instanceof Error && /^WCS HTTP 4\d\d$/.test(error.message));
+        const refused = isWcsRefusal(error);
         const advertised = described.crses ?? [];
         if (!refused || !advertised.length || advertised.includes(description.crs)) throw error;
         throw new WcsMessageError(

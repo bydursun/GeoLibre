@@ -372,6 +372,89 @@ export function defaultWcsCrs(crses: readonly string[]): WcsCrs {
   return WCS_CRSES.find((value) => crses.includes(value)) ?? "EPSG:4326";
 }
 
+/**
+ * Axis labels a SUBSET takes in each request CRS, as GeoServer spells them.
+ * Keep `Long`: GeoServer rejects `Lon`, the current EPSG abbreviation.
+ */
+const WCS_CRS_AXES: Record<WcsCrs, { x: string; y: string }> = {
+  "EPSG:4326": { x: "Long", y: "Lat" },
+  "EPSG:3857": { x: "X", y: "Y" },
+};
+
+/**
+ * Returns the description with subset axes named for the subsetting CRS.
+ *
+ * WCS 2.0.1 servers disagree on which labels a SUBSET takes once
+ * SUBSETTINGCRS differs from the coverage's native CRS: ArcGIS Server and
+ * MapServer accept only the coverage's own labels, while GeoServer accepts
+ * only the subsetting CRS's (`Long`/`Lat`, `X`/`Y`) and rejects the native
+ * ones with InvalidAxisLabel. The request goes out with the native labels
+ * first; this alternative is the one retry after a refusal.
+ *
+ * @param description - The described coverage, with the request CRS chosen
+ * @returns The description with CRS axis labels, or undefined when the
+ *   request already uses the native CRS or those labels
+ */
+export function withSubsettingCrsAxes(description: WcsDescription): WcsDescription | undefined {
+  const { axes, crs, crsExtension, nativeCrs, version } = description;
+  if (version !== "2.0.1" || !crsExtension || !axes || nativeCrs === crs) return undefined;
+  const labels = WCS_CRS_AXES[crs];
+  if (!labels || (labels.x === axes.x && labels.y === axes.y)) return undefined;
+  return { ...description, axes: { ...labels } };
+}
+
+/**
+ * Whether a GetCoverage failure is the server refusing the request.
+ *
+ * An exception report or non-raster body, or an HTTP 4xx, is a refusal of the
+ * request itself. Authentication (401, 403) and rate limiting (429) are not,
+ * so they neither earn the axis-label retry nor the CRS hint; nor do size,
+ * timeout, network and conversion failures. This is about one GetCoverage,
+ * unlike the status list `discoverWcs` uses to decide whether to try another
+ * protocol version.
+ *
+ * @param error - The download failure
+ * @returns True for a refusal
+ */
+export function isWcsRefusal(error: unknown): boolean {
+  if (error instanceof WcsError) return error.code === "response";
+  const status = error instanceof Error ? /^WCS HTTP (4\d\d)$/.exec(error.message)?.[1] : undefined;
+  return !!status && !["401", "403", "429"].includes(status);
+}
+
+/**
+ * Downloads a coverage, retrying a refusal once at an alternative URL.
+ *
+ * Used with {@link withSubsettingCrsAxes}: any refusal earns the retry, since
+ * a bare 4xx carries no exception code to single out InvalidAxisLabel. The
+ * first refusal is the error reported whenever the retry fails too, unless the
+ * request was aborted, because it explains the failure and carries the CRS
+ * context; the retry is a fallback the user never asked for.
+ *
+ * @param download - Fetches one URL
+ * @param url - The request with the coverage's native axis labels
+ * @param retryUrl - The request with the subsetting CRS's labels, if any
+ * @param signal - Aborts both attempts
+ * @returns The downloaded coverage
+ */
+export async function downloadWithAxisRetry<T>(
+  download: (url: string) => Promise<T>,
+  url: string,
+  retryUrl: string | undefined,
+  signal: AbortSignal,
+): Promise<T> {
+  try {
+    return await download(url);
+  } catch (error) {
+    if (!retryUrl || !isWcsRefusal(error) || signal.aborted) throw error;
+    try {
+      return await download(retryUrl);
+    } catch (retryError) {
+      throw signal.aborted ? retryError : error;
+    }
+  }
+}
+
 const MERCATOR_RADIUS = 6378137;
 const MERCATOR_MAX_LATITUDE = 85.0511287798066;
 
