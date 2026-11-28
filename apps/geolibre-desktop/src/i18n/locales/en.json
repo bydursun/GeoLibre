@@ -5569,7 +5569,8 @@
     "recording": "Recording",
     "recordingFailed": "Recording failed.",
     "recordingUnsupported": "Canvas recording is not supported in this browser.",
-    "loadingTiles": "Loading tiles…"
+    "loadingTiles": "Loading tiles…",
+    "recordingNeedsMap": "Recording needs the 2D map. Switch the rendering engine to record."
   },
   "mapillary": {
     "title": "Mapillary",

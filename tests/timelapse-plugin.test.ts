@@ -561,3 +561,106 @@ describe("maplibreTimelapsePlugin", () => {
     assert.equal(control.isPlaying(), false);
   });
 });
+
+/**
+ * A host on the Cesium globe (or ArcGIS): no style map, only the control
+ * facade, whose container hosts the year badge.
+ */
+function fakeGlobeApp(facadeKey: "getCesiumControlMap" | "getArcgisControlMap") {
+  const app = fakeApp(fakeMap());
+  const container = {
+    children: [] as unknown[],
+    appendChild(child: unknown) {
+      this.children.push(child);
+    },
+  };
+  const facade = { getContainer: () => container };
+  Object.assign(app, {
+    getMap: () => null,
+    [facadeKey]: () => facade as unknown as MapLibreMap,
+  });
+  return app;
+}
+
+describe("maplibreTimelapsePlugin without a style map", () => {
+  beforeEach(() => {
+    useAppStore.setState({ layers: [] });
+    plugin.applyProjectState?.(fakeApp(fakeMap()), null);
+  });
+
+  afterEach(() => {
+    if (getActiveTimelapseControl()) plugin.deactivate(fakeGlobeApp("getCesiumControlMap"));
+    useAppStore.setState({ layers: [] });
+  });
+
+  it("draws the active year as a plain raster store layer on the globe", () => {
+    plugin.activate(fakeGlobeApp("getCesiumControlMap"));
+    const control = getActiveTimelapseControl();
+    assert.ok(control);
+    assert.equal(control.storeDrawn, true);
+
+    const layer = storeLayer();
+    assert.ok(layer, "store layer exists");
+    assert.equal(layer.type, "raster");
+    assert.equal(layer.metadata.sourceKind, TIMELAPSE_SOURCE_KIND);
+    // No native stack: nothing for an ordering-only sync path to look after.
+    assert.equal(layer.metadata.customLayerType, undefined);
+    assert.equal(layer.metadata.nativeLayerIds, undefined);
+    const year = control.getState().year;
+    const tiles = layer.source.tiles as string[];
+    assert.equal(tiles.length, 1);
+    assert.ok(tiles[0].includes(`/s2cloudless-${year}_3857/`), tiles[0]);
+    assert.equal(layer.source.tileSize, 256);
+  });
+
+  it("swaps the store layer's tile template when the year changes", () => {
+    plugin.activate(fakeGlobeApp("getArcgisControlMap"));
+    const control = getActiveTimelapseControl();
+    assert.ok(control);
+    assert.equal(control.storeDrawn, true);
+
+    control.setFrameIndex(0);
+    assert.ok((storeLayer()?.source.tiles as string[])[0].includes("/s2cloudless-2018_3857/"));
+    control.setFrameIndex(3);
+    assert.ok((storeLayer()?.source.tiles as string[])[0].includes("/s2cloudless-2021_3857/"));
+    assert.equal(
+      useAppStore
+        .getState()
+        .layers.filter((item) => item.metadata.sourceKind === TIMELAPSE_SOURCE_KIND).length,
+      1,
+    );
+  });
+
+  it("keeps the store layer's visibility and opacity across a year change", () => {
+    plugin.activate(fakeGlobeApp("getCesiumControlMap"));
+    const control = getActiveTimelapseControl();
+    assert.ok(control);
+    useAppStore.getState().updateLayer(STORE_LAYER_ID, { opacity: 0.4 });
+    control.setFrameIndex(1);
+    assert.equal(storeLayer()?.opacity, 0.4);
+    assert.equal(storeLayer()?.visible, true);
+  });
+
+  it("switches provider through the store layer", async () => {
+    plugin.activate(fakeGlobeApp("getCesiumControlMap"));
+    const control = getActiveTimelapseControl();
+    assert.ok(control);
+
+    await control.switchProvider(NASA_GIBS_WELD_PROVIDER_ID);
+
+    const layers = useAppStore
+      .getState()
+      .layers.filter((item) => item.metadata.sourceKind === TIMELAPSE_SOURCE_KIND);
+    assert.equal(layers.length, 1);
+    assert.equal(layers[0].id, timelapseStoreLayerId(NASA_GIBS_WELD_PROVIDER_ID));
+    assert.ok((layers[0].source.tiles as string[])[0].includes("/1983-12-01/"));
+  });
+
+  it("removes the store layer on deactivate", () => {
+    const app = fakeGlobeApp("getCesiumControlMap");
+    plugin.activate(app);
+    assert.ok(storeLayer());
+    plugin.deactivate(app);
+    assert.equal(storeLayer(), undefined);
+  });
+});

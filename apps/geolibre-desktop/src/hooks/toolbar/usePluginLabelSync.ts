@@ -1015,6 +1015,7 @@ export function usePluginLabelSync(): void {
           recordingFailed: t("timelapse.recordingFailed"),
           recordingUnsupported: t("timelapse.recordingUnsupported"),
           loadingTiles: t("timelapse.loadingTiles"),
+          recordingNeedsMap: t("timelapse.recordingNeedsMap"),
         }),
     });
     configureBuiltInPluginModule("stac", {

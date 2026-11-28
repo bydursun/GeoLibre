@@ -99,6 +99,12 @@ map and otherwise places the same markup through `project()` on every frame
 drops the `click` that ends a drag, as MapLibre's click tolerance does, so
 panning the globe does not trigger a click-driven control.
 
+Timelapse has no native frame stack to add on the globe. Its one store layer
+carries the active year's tile template instead, so a year step is a store
+update the layer sync redraws as a new imagery layer (ArcGIS draws it the same
+way). Playback, the provider picker and the year badge work; recording needs
+the 2D map canvas, so Record is disabled there.
+
 ## Scene and camera
 
 The globe provides 3D, 2D, and Columbus scene modes, terrain, native globe

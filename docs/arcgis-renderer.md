@@ -201,10 +201,12 @@ override draws Esri World Imagery instead.
 - **USGS NLDI** and **Reverse Geocode**, whose popups are placed through the
   control map's `project()` (`map-popup.ts` in the plugins package) in place of
   MapLibre's `Popup`, which needs a MapLibre map.
+- **Timelapse**, drawn from its store layer, which carries the active year's
+  tile template; recording to video needs a MapLibre or Mapbox map.
 - **Controls** menu entries and plugins whose plugin needs a MapLibre, Mapbox
   or Cesium map (Atmospheric Effects, Sun, Route Animation, Flight Simulator,
-  Directions, the Geo Editor, Annotations, Swipe, Street View,
-  Timelapse and others) are greyed out with the reason while ArcGIS is the
+  Directions, the Geo Editor, Annotations, Swipe, Street View
+  and others) are greyed out with the reason while ArcGIS is the
   primary renderer.
 - If the SDK cannot be loaded from the CDN, the map's banner offers **Retry**,
   which reloads the page: the browser keeps a failed module import for the life

@@ -27,6 +27,7 @@ import { maplibreVantorPlugin } from "../packages/plugins/src/plugins/maplibre-v
 import { maplibreEarthaccessPlugin } from "../packages/plugins/src/plugins/maplibre-earthaccess";
 import { maplibreUsgsDemPlugin } from "../packages/plugins/src/plugins/maplibre-usgs-dem";
 import { maplibreUsgsNldiPlugin } from "../packages/plugins/src/plugins/maplibre-usgs-nldi";
+import { maplibreTimelapsePlugin } from "../packages/plugins/src/plugins/maplibre-timelapse";
 import { cartoLightPlugin } from "../packages/plugins/src/plugins/carto-light";
 import {
   isExternalPluginManifest,
@@ -158,6 +159,12 @@ describe("Tier 1 built-in plugin engine support audit", () => {
   // its hover popup goes through `createMapPopup`.
   it("declares every engine on USGS NLDI", () => {
     assert.deepEqual(maplibreUsgsNldiPlugin.engines, ["maplibre", "mapbox", "arcgis", "cesium"]);
+  });
+
+  // Timelapse animates native raster layers on a style map; on the globe and
+  // ArcGIS its store layer carries the active year's tile template instead.
+  it("declares every engine on Timelapse", () => {
+    assert.deepEqual(maplibreTimelapsePlugin.engines, ["maplibre", "mapbox", "arcgis", "cesium"]);
   });
 
   it("defaults MapLibre-only plugins without explicit engines to maplibre", () => {

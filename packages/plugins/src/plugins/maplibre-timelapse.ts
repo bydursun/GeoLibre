@@ -22,6 +22,13 @@ import { builtInPluginProperties } from "../builtin-plugin-metadata";
  * panel entry) whose `metadata.customLayerType` puts it on layer-sync's
  * ordering-only path — panel reorder moves all native layers together, while
  * this plugin owns their visibility/paint by subscribing to the store.
+ *
+ * Globe (Cesium) and ArcGIS: neither has a style map to add raster layers to,
+ * but both draw a store `raster` record from its tile template. There the
+ * store layer carries the active year's template itself and a year change is
+ * a store update, which the engine's layer sync redraws ({@link
+ * TimelapseControl.storeDrawn}). Recording needs the 2D map canvas, so it is
+ * disabled there.
  */
 
 import { DEFAULT_LAYER_STYLE, useAppStore, type GeoLibreLayer } from "@geolibre/core";
@@ -145,6 +152,8 @@ export interface TimelapseLabels {
   recordingFailed: string;
   recordingUnsupported: string;
   loadingTiles: string;
+  /** Record button tooltip on a renderer without a 2D map canvas (the globe). */
+  recordingNeedsMap: string;
 }
 
 export const DEFAULT_TIMELAPSE_LABELS: TimelapseLabels = {
@@ -164,6 +173,7 @@ export const DEFAULT_TIMELAPSE_LABELS: TimelapseLabels = {
   recordingFailed: "Recording failed.",
   recordingUnsupported: "Canvas recording is not supported in this browser.",
   loadingTiles: "Loading tiles…",
+  recordingNeedsMap: "Recording needs the 2D map. Switch the rendering engine to record.",
 };
 
 let labels: TimelapseLabels = { ...DEFAULT_TIMELAPSE_LABELS };
@@ -208,6 +218,60 @@ function stylePillButton(button: HTMLButtonElement): void {
 // ---------------------------------------------------------------------------
 // Store layer mirror
 // ---------------------------------------------------------------------------
+
+/**
+ * The raster source a store-drawn timelapse layer carries for one frame: the
+ * frame's tile template plus what the engines read off a raster record
+ * (tile size, zoom range, Y-axis scheme, credit).
+ *
+ * @param provider - The provider the frame belongs to (its id stays on the
+ *   source, and its attribution is the credit, as on the native stack).
+ * @param frame - The frame to draw.
+ * @returns The store layer `source` for that frame.
+ */
+export function timelapseFrameStoreSource(
+  provider: TimelapseProvider,
+  frame: TimelapseFrame,
+): GeoLibreLayer["source"] {
+  return {
+    type: "raster",
+    providerId: provider.id,
+    tiles: [frame.tileUrlTemplate],
+    tileSize: frame.tileSize ?? 256,
+    ...(frame.minzoom !== undefined ? { minzoom: frame.minzoom } : {}),
+    ...(frame.maxzoom !== undefined ? { maxzoom: frame.maxzoom } : {}),
+    ...(frame.scheme === "tms" ? { scheme: "tms" } : {}),
+    attribution: provider.attribution,
+  };
+}
+
+/**
+ * The store layer for a renderer without a style map (the Cesium globe,
+ * ArcGIS): an ordinary raster record of the active frame, which the engine
+ * draws itself. It has no native layers to register, so it carries no
+ * `customLayerType`/`nativeLayerIds`; `externalNativeLayer` and `sourceKind`
+ * still mark it plugin-owned so the plugin can find and prune it.
+ */
+function createStoreDrawnTimelapseLayer(
+  provider: TimelapseProvider,
+  frame: TimelapseFrame,
+  snapshot: StoreLayerSnapshot,
+): GeoLibreLayer {
+  return {
+    id: timelapseStoreLayerId(provider.id),
+    name: `Timelapse: ${provider.name}`,
+    type: "raster",
+    source: timelapseFrameStoreSource(provider, frame),
+    visible: snapshot.visible,
+    opacity: snapshot.opacity,
+    style: { ...DEFAULT_LAYER_STYLE },
+    metadata: {
+      externalNativeLayer: true,
+      identifiable: false,
+      sourceKind: TIMELAPSE_SOURCE_KIND,
+    },
+  };
+}
 
 function createTimelapseStoreLayer(
   provider: TimelapseProvider,
@@ -261,6 +325,14 @@ function removeTimelapseStoreLayers(): void {
 
 interface TimelapseControlOptions {
   map: MapLibreMap | null;
+  /**
+   * Draw the frames through the store instead of native layers: set when no
+   * style map exists but the active renderer draws store raster records (the
+   * Cesium globe, ArcGIS). `map` is then null.
+   */
+  storeDrawn?: boolean;
+  /** Where the on-map year badge mounts when there is no style map. */
+  overlayContainer?: HTMLElement | null;
   provider: TimelapseProvider;
   frames: TimelapseFrame[];
   initial: TimelapseProjectState | null;
@@ -279,6 +351,14 @@ export class TimelapseControl {
   frames: TimelapseFrame[];
 
   private map: MapLibreMap | null;
+  /**
+   * True on a renderer without a style map (the Cesium globe, ArcGIS): the
+   * single store layer carries the active frame's tile template, so a year
+   * change is a store update the engine's layer sync redraws, and there is no
+   * native stack to pre-warm, show, hide or record.
+   */
+  readonly storeDrawn: boolean;
+  private overlayContainer: HTMLElement | null;
   private frameIndex = 0;
   private secondsPerYear: number;
   private loop: boolean;
@@ -322,6 +402,8 @@ export class TimelapseControl {
 
   constructor(options: TimelapseControlOptions) {
     this.map = options.map;
+    this.storeDrawn = options.storeDrawn === true;
+    this.overlayContainer = options.overlayContainer ?? null;
     this.provider = options.provider;
     this.frames = options.frames;
     const initial = options.initial;
@@ -373,6 +455,10 @@ export class TimelapseControl {
    * when the user re-engages after deleting the Layers-panel entry.
    */
   ensureStack(): void {
+    if (this.storeDrawn) {
+      this.ensureStoreDrawnLayer();
+      return;
+    }
     const map = this.map;
     if (!map) return;
     const snapshot = getStoreLayerSnapshot();
@@ -412,6 +498,37 @@ export class TimelapseControl {
       useAppStore.getState().addLayer(createTimelapseStoreLayer(this.provider, this.frames));
     }
     this.armTilesReadyGate();
+  }
+
+  /**
+   * The store-drawn counterpart of {@link ensureStack}: add the store layer
+   * for the active frame, or point an existing one at it. Tiles are the
+   * engine's to fetch, so Play/Record gating has nothing to wait for.
+   */
+  private ensureStoreDrawnLayer(): void {
+    this.stackPresent = true;
+    this.tilesReady = true;
+    this.syncStoreDrawnFrame();
+    this.updateUi();
+  }
+
+  /**
+   * Write the active frame into the store layer (creating it when absent):
+   * the engine's layer sync sees the new tile template and redraws the year.
+   */
+  private syncStoreDrawnFrame(): void {
+    const frame = this.frames[this.frameIndex];
+    if (!frame) return;
+    const store = useAppStore.getState();
+    const layerId = timelapseStoreLayerId(this.provider.id);
+    const existing = store.layers.find((layer) => layer.id === layerId);
+    if (!existing) {
+      store.addLayer(createStoreDrawnTimelapseLayer(this.provider, frame, getStoreLayerSnapshot()));
+      return;
+    }
+    const source = timelapseFrameStoreSource(this.provider, frame);
+    if (JSON.stringify(existing.source) === JSON.stringify(source)) return;
+    store.updateLayer(layerId, { source });
   }
 
   /** Remove every frame layer/source this control added (guarded lookups). */
@@ -533,6 +650,13 @@ export class TimelapseControl {
       this.updateUi();
       return;
     }
+    if (this.storeDrawn) {
+      // The engine draws the store layer's own visible/opacity; only playback
+      // reacts (a hidden layer has nothing to animate).
+      if (!next.visible && previous.visible) this.pause();
+      this.updateUi();
+      return;
+    }
     const map = this.map;
     if (!map || !this.stackPresent) return;
     if (next.visible !== previous.visible || !previous.exists) {
@@ -569,6 +693,11 @@ export class TimelapseControl {
     const previous = this.frames[this.frameIndex];
     const target = this.frames[clamped];
     this.frameIndex = clamped;
+    if (this.storeDrawn) {
+      if (this.stackPresent) this.syncStoreDrawnFrame();
+      this.updateUi();
+      return;
+    }
     const map = this.map;
     if (map && this.stackPresent) {
       const snapshot = getStoreLayerSnapshot();
@@ -748,7 +877,7 @@ export class TimelapseControl {
     // programmatic path too): recording against an absent stack would export
     // a blank map with year labels, and starting before the pre-warm idle
     // would capture half-loaded opening frames.
-    if (!this.stackPresent || !this.tilesReady) return;
+    if (!this.stackPresent || !this.tilesReady || this.storeDrawn) return;
     this.recording = true;
     this.recordAbort = new AbortController();
     this.pause();
@@ -999,7 +1128,7 @@ export class TimelapseControl {
   /** Big on-map year overlay (screen only; recordings burn their own copy). */
   private mountBadge(): void {
     if (this.badge) return;
-    const container = this.map?.getContainer?.();
+    const container = this.map?.getContainer?.() ?? this.overlayContainer;
     if (!container) return;
     const badge = document.createElement("div");
     badge.className = "geolibre-timelapse-badge";
@@ -1060,8 +1189,16 @@ export class TimelapseControl {
       // Gate Record like Play — but never disable it mid-recording, when the
       // same button is the Stop control.
       this.recordButton.disabled =
-        !this.recording && (this.frames.length < 2 || !this.stackPresent || !this.tilesReady);
-      this.recordButton.title = !this.tilesReady && !this.recording ? labels.loadingTiles : "";
+        !this.recording &&
+        (this.storeDrawn || this.frames.length < 2 || !this.stackPresent || !this.tilesReady);
+      // The pill style has no disabled look of its own; dim it so a Record
+      // that cannot run (no 2D map canvas, tiles still loading) reads as such.
+      this.recordButton.style.opacity = this.recordButton.disabled ? "0.5" : "";
+      this.recordButton.title = this.storeDrawn
+        ? labels.recordingNeedsMap
+        : !this.tilesReady && !this.recording
+          ? labels.loadingTiles
+          : "";
     }
     if (this.slider) this.slider.disabled = this.recording;
     // Switching providers mid-recording would tear down the layers the export
@@ -1362,8 +1499,15 @@ function activateWithFrames(
   if (frames.length === 0) return false;
   if (!app.registerRightPanel || !app.openRightPanel) return false;
   appRef = app;
+  // engine-audit-allow: arcgis-null-map (a null style map selects the store-drawn path below)
+  const map = getStyleMap(app);
+  // No style map, but a renderer that draws store raster records: the globe or
+  // ArcGIS. Its control facade is only read for the badge's container.
+  const facade = map ? null : (app.getCesiumControlMap?.() ?? app.getArcgisControlMap?.() ?? null);
   const control = new TimelapseControl({
-    map: getStyleMap(app),
+    map,
+    storeDrawn: Boolean(facade),
+    overlayContainer: facade?.getContainer?.() ?? null,
     provider,
     frames,
     initial: savedState,
@@ -1372,6 +1516,7 @@ function activateWithFrames(
   control.ensureStack();
   unsubscribeStore = subscribeStoreLayer(control);
   unsubscribeBasemap = app.onBasemapChange(() => {
+    // engine-audit-allow: arcgis-null-map (store-drawn frames survive a basemap change)
     const map = getStyleMap(app);
     if (!map || !timelapseControl) return;
     // A basemap change reloads the style, wiping this plugin's sources and
@@ -1403,6 +1548,8 @@ export const maplibreTimelapsePlugin: GeoLibrePlugin = {
   // reads the map canvas (which the Mapbox pane keeps drawable), so the plugin
   // runs on either 2D engine; the store mirror is plugin-owned on Mapbox
   // (`isMapboxPluginLayer`), as its `providerId` source is not compilable.
+  // On the Cesium globe and ArcGIS the frames are drawn from the store layer
+  // instead (see `TimelapseControl.storeDrawn`).
 
   activate: (app: GeoLibreAppAPI) => {
     const session = ++activationSession;

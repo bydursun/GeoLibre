@@ -587,7 +587,7 @@ export const BUILT_IN_PLUGIN_METADATA = [
     id: TIMELAPSE_PLUGIN_ID,
     name: "Timelapse",
     version: "0.2.0",
-    engines: ["maplibre", "mapbox"],
+    engines: ["maplibre", "mapbox", "arcgis", "cesium"],
     hooks: ["getProjectState", "applyProjectState"],
     category: "tools",
   },
